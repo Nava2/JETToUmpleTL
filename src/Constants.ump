@@ -2,6 +2,36 @@ namespace cruise.umple.fromjet;
 
 // Basic templates
 class Constants {
+    // Expression, Directive, Code are self-explanatory
+    // Text (or PureText) is everything not contained in one of the other operations
+    public enum Operation {
+        Expression, Directive, Code, Text, None;
+        
+        // Should be used to check what specific operation is started on the line.
+        // Isn't very smart, won't work if an operation is continuing
+        public static Operation operationStartingOnLine(String line) {
+            int indexOfStart = line.indexOf(JETConstants.SpecialBlockStart);
+            if (indexOfStart != -1) {
+                return getStartingOperation(line.substring(indexOfStart));
+            }
+            
+            return Operation.Text;
+        }
+        
+        // Will determine which operation is starting at the beginning of the given line
+        public static Operation getStartingOperation(String line) {
+            if (line.startsWith(JETConstants.ExpressionStart)) {
+                return Operation.Expression;
+            } else if (line.startsWith(JETConstants.DirectiveStart)) {
+                return Operation.Directive;
+            } else if (line.startsWith(JETConstants.CodeStart)) {
+                return Operation.Code;
+            } else {
+                return Operation.Text;
+            }
+        }
+    };
+    
     const String NewLine = System.getProperties().getProperty("line.separator");
     
     public static final String[] FunctionEnders = {"}", "end"};
@@ -33,7 +63,6 @@ class JETConstants {
 
 // These are all constants for creating the Umple templates
 class UmpleTemplateConstants {
-
     const String SpecialBlockStart = "<<";
     const String SpecialBlockEnd = ">>";
     

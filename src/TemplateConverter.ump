@@ -1,5 +1,6 @@
 namespace cruise.umple.fromjet;
 
+use BlockParsers.ump;
 use Constants.ump;
 use DirectiveParser.ump;
 use Elements.ump;
@@ -9,6 +10,7 @@ use SkeletonGenerator.ump;
 class TemplateConverter {
     depend java.nio.file.Path;
     depend java.io.*;
+    depend javafx.util.Pair;
     
     
     lazy internal DirectiveParser directive;
@@ -19,40 +21,9 @@ class TemplateConverter {
     internal templateName;
     internal TemplateElement[] elements;
     boolean isMainTemplate;
-    internal boolean containsTabs = false;
     
     // Templates that it depends on
     internal HashSet<String> allDependencies = new HashSet<>();
-    
-    // Expression, Directive, Code are self-explanatory
-    // Text (or PureText) is everything not contained in one of the other operations
-    private enum Operation {
-        Expression, Directive, Code, Text, None;
-        
-        // Should be used to check what specific operation is started on the line.
-        // Isn't very smart, won't work if an operation is continuing
-        private static Operation operationStartingOnLine(String line) {
-            int indexOfStart = line.indexOf(JETConstants.SpecialBlockStart);
-            if (indexOfStart != -1) {
-                return getStartingOperation(line.substring(indexOfStart));
-            }
-            
-            return Operation.Text;
-        }
-        
-        // Will determine which operation is starting at the beginning of the given line
-        private static Operation getStartingOperation(String line) {
-            if (line.startsWith(JETConstants.ExpressionStart)) {
-                return Operation.Expression;
-            } else if (line.startsWith(JETConstants.DirectiveStart)) {
-                return Operation.Directive;
-            } else if (line.startsWith(JETConstants.CodeStart)) {
-                return Operation.Code;
-            } else {
-                return Operation.Text;
-            }
-        }
-    };
     
     public boolean convert() {
         elements.clear();
@@ -140,10 +111,10 @@ class TemplateConverter {
             // Must remove the spaces and newline leading into the Operation
             // Otherwise, the newline should be kept
             boolean startsWithCodeOrDirective = false;
-            Operation operation = Operation.operationStartingOnLine(rest);
+            Constants.Operation operation = Constants.Operation.operationStartingOnLine(rest);
             int pos = rest.indexOf(JETConstants.SpecialBlockStart);
             
-            if (operation == Operation.Code || operation == Operation.Directive) {
+            if (operation == Constants.Operation.Code || operation == Constants.Operation.Directive) {
                 startsWithCodeOrDirective = containsOnlySpaces(rest.substring(0, pos));
             }
             
@@ -156,294 +127,52 @@ class TemplateConverter {
 
 
         // PreviousOp is currently just used by pure text
-        Operation previousOp = Operation.None;
+        Constants.Operation previousOp = Constants.Operation.None;
+        
+        ExpressionBlockParser expressionParser = new ExpressionBlockParser();
+        DirectiveBlockParser directiveParser = new DirectiveBlockParser();
+        CodeBlockParser codeParser = new CodeBlockParser();
+        PureTextBlockParser pureTextParser = new PureTextBlockParser();
         
         // Rest is what was left of the previous line after the end of the previous operation
         while (rest != null) {
-            Operation currentOp = Operation.getStartingOperation(rest);
+            Constants.Operation currentOp = Constants.Operation.getStartingOperation(rest);
+            Pair<String, TemplateElement> parsedPair;
             switch (currentOp) {
                 case Expression:
-                    rest = parseExpressionBlock(bufferedReader, rest);
+                    parsedPair = expressionParser.translate(bufferedReader, rest, previousOp);
                     break;
                     
                 case Directive:
-                    rest = parseDirectiveBlock(bufferedReader, rest);
+                    parsedPair = directiveParser.translate(bufferedReader, rest, previousOp);
                     break;
                     
                 case Code:
-                    rest = parseCodeBlock(bufferedReader, rest);
+                    parsedPair = codeParser.translate(bufferedReader, rest, previousOp);
                     break;
-                    
+                
+                // PureText
                 default:
-                    rest = parsePureText(bufferedReader, rest, previousOp);
+                    parsedPair = pureTextParser.translate(bufferedReader, rest, previousOp);
                     break;
             }
             
             previousOp = currentOp;
+            rest = parsedPair.getKey();
+            elements.add(parsedPair.getValue());
         }
         
-        if (containsTabs) {
+        allDependencies = directiveParser.getAllDependencies();
+        
+        for (String unhandledDirective : directiveParser.getAllUnhandledDirectives()) {
+            printWarning("Warning, the directive " + unhandledDirective + " is not currently handled");
+        }
+        
+        if (pureTextParser.getTemplateContainsTabs()) {
             printWarning("Contains tabs, which will be converted to 4 spaces");
         }
         
         return true;
-    }
-    
-    // Will be refactoring the parse*Block functions into a group of classes
-    // Will be in a separate pull request, due to the significance of the code changes
-    private String parseExpressionBlock(BufferedReader bufferedReader, String restOfLine) throws IOException {
-        StringBuffer buffer = new StringBuffer();
-        buffer.append(UmpleTemplateConstants.ExpressionStart);
-        
-        String line = restOfLine.substring(JETConstants.ExpressionStart.length());
-        
-        // Read all full lines first
-        while (!operationIsFinished(line, JETConstants.ExpressionEnd)) {
-            buffer.append(line);
-            line = bufferedReader.readLine();
-            if (shouldAppendNewline(line, Operation.Expression)) {
-                buffer.append(Constants.NewLine);
-            }
-        }
-        
-        if (line != null)
-        {
-            int indexOf = line.indexOf(JETConstants.ExpressionEnd);
-            
-            buffer.append(line.substring(0, indexOf));
-            line = line.substring(indexOf + JETConstants.ExpressionEnd.length());
-        }
-
-        buffer.append(UmpleTemplateConstants.ExpressionEnd);
-        elements.add(new BasicElement(buffer.toString()));
-        
-        return line;
-    }
-    
-    private String parseDirectiveBlock(BufferedReader bufferedReader, String restOfLine) throws IOException {
-        // Skip past the directive start, to where the first non-space character is
-        int toSkip = JETConstants.DirectiveStart.length() + 1;
-        while (restOfLine.charAt(toSkip) == ' ') {
-            ++toSkip;
-        }
-
-        String line = restOfLine.substring(toSkip);
-           
-        // Currently the only directive handled
-        if (line.startsWith(JETConstants.DirectiveInclude)) {
-            // Only want from the start of the template name (one past the first ")
-            // to the . since won't care about the extension
-            int start = line.indexOf('"') + 1;
-            int end = line.indexOf('.', start);
-       
-            String template = line.substring(start, end);
-            elements.add(new ImportElement(template));
-            allDependencies.add(template);
-        } else {
-            String directive = line.split(" ")[0];
-            printWarning("Warning, the directive " + directive + " is not currently handled");
-        }
-        
-        // Handle any possible multi-line directives
-        while (!operationIsFinished(line, JETConstants.DirectiveEnd)) {
-            line = bufferedReader.readLine();
-        }
-        
-        if (line != null) {
-            line = line.substring(line.indexOf(JETConstants.DirectiveEnd) + JETConstants.DirectiveEnd.length());
-        }
-        
-        return line;
-    }
-    
-    private String parseCodeBlock(BufferedReader bufferedReader, String restOfLine) throws IOException {
-        StringBuffer buffer = new StringBuffer();
-        
-        buffer.append(UmpleTemplateConstants.CodeStart);
-        
-        String line = restOfLine.substring(JETConstants.CodeStart.length());
-        if (line != null) {
-            line = line.replaceAll(JETConstants.StringBufferName, UmpleTemplateConstants.StringBufferName);
-        }
-            
-        // Read all full lines first
-        while (!operationIsFinished(line, JETConstants.CodeEnd)) {
-            buffer.append(line);
-            line = bufferedReader.readLine();
-            if (shouldAppendNewline(line, Operation.Code)) {
-                buffer.append(Constants.NewLine);
-            }
-            if (line != null) {
-                line = line.replaceAll(JETConstants.StringBufferName, UmpleTemplateConstants.StringBufferName);
-            }
-        }
-        
-        if (line != null)
-        {
-            int indexOf = line.indexOf(JETConstants.CodeEnd);
-        
-            buffer.append(line.substring(0, indexOf));
-            line = line.substring(indexOf + JETConstants.CodeEnd.length());
-        }
-
-        buffer.append(UmpleTemplateConstants.CodeEnd);
-        
-        elements.add(new BasicElement(buffer.toString()));
-        
-        return line;
-    }
-    
-    private String parsePureText(BufferedReader bufferedReader, String restOfLine, Operation previousOp) throws IOException {
-        StringBuffer buffer = new StringBuffer();
-        String line = restOfLine, previousLine = null;
-        
-        // For some of the special cases, records if the line before previous line contained a function ender, like a } or end
-        boolean functionEnderOccuredTwoLinesAgo = false;
-        
-        // Records if the entire block contained only spaces
-        // Used for a special case involving Code blocks
-        boolean blockContainedOnlySpaces = true;
-        
-        line = removeAnyTabs(line);
-        
-        // Read all full lines first
-        while (!operationIsFinished(line, JETConstants.PureTextEnd)) {
-            if (!containsOnlySpaces(line)) {
-                blockContainedOnlySpaces = false;
-            }
-            
-            buffer.append(line);
-            functionEnderOccuredTwoLinesAgo = containsFunctionEnderAtEnd(previousLine);
-            previousLine = line;
-            
-            line = bufferedReader.readLine();
-            if (shouldAppendNewline(line, Operation.Text)) {
-                buffer.append(Constants.NewLine);
-            }
-            
-            line = removeAnyTabs(line);
-        }
-        
-        // Special case which involving the last line of the file
-        // In general, JET will remove the last textual line of a file if it is just spaces
-        // Umple will never remove it, so may need to remove the last line
-        //   For the current restrictions:
-        //      1) Final line of file (previousLine) must have been just spaces
-        //      2) There wasn't a function ender (} or end) at end of line before the blank line
-        //      3) This block didn't a) follow an Operation.Code and b) contain only spaces (very specific)
-        if (line == null && containsOnlySpaces(previousLine)) {
-            // WARNING: This special case is not complete, with there being one issue: #4
-            //    It is based around having an extra newline at the end of a file
-            //      It is easily identified in Git, with "No newline at end of file"
-            //      What will happen (I believe) is that, for files with No newline, JET will keep the last line, but the Java conversions doesn't
-            //      currently detect this
-            if (!functionEnderOccuredTwoLinesAgo && !(previousOp == Operation.Code && blockContainedOnlySpaces)) {
-                // First, delete the last line of text. This is fine even if it is just ""
-                int index = buffer.lastIndexOf(previousLine);
-                if (index != -1) {
-                    buffer.delete(index, buffer.length());
-                }
-                
-                // Then, need to delete the newline before it, if it exists
-                // But only if there wasn't a brace at the end
-                index = buffer.lastIndexOf(Constants.NewLine);
-                if (index != -1) {
-                    buffer.delete(index, buffer.length());
-                }
-            }
-        }
-        
-        if (line != null)
-        {
-            // Work around for Directives
-            line = removeSpacesExtraIfIsSpacesFollowedByDirective(line);
-            
-            int indexOfNextOperationStart = line.indexOf(JETConstants.PureTextEnd);
-            String earlierPartOfLine = line.substring(0, indexOfNextOperationStart);
-            
-            // Relates to issue #6
-            // Problem is how it will output the part of the line, even if will be adding a blank line due to the special cases
-            // below
-            buffer.append(earlierPartOfLine);
-            
-            // Update the line, then get the operation
-            line = line.substring(indexOfNextOperationStart);
-            Operation nextOperation = Operation.getStartingOperation(line);
-            
-            // Handle two different special cases revolving around Operation.Code when there are multiple lines
-            if (nextOperation == Operation.Code && previousLine != null) {
-                String generated = buffer.toString();
-                int numNewlines = (generated.length() - generated.replace(Constants.NewLine, "").length()) / Constants.NewLine.length();
-                
-                // Special case which involves 3 lines at the end of a PureText block:
-                // 1) First line contained a function ender (currently just } or 'end')
-                // 2) Second line contains only spaces
-                // 3) Third line is spaces followed by a Code, Directive, or Expression operation (leads into a <%)
-                //    (since these are only ones that can end a Puretext without being end of file, must be met inside this if)
-                // In this case, JET will add an additional newline when compared to Umple, so need to add it as well
-                if (functionEnderOccuredTwoLinesAgo && containsOnlySpaces(previousLine) && containsOnlySpaces(earlierPartOfLine)) {
-                    buffer.append(Constants.NewLine);
-                }
-                
-                // Special case which involves PureText containing only 3 lines:
-                // 1) First line contained a non-puretext operation
-                // 2) Second line contains only spaces
-                // 3) Third line is spaces followed by a Code, Directive, or Expression operation (leads into a <%)
-                //    (since these are only ones that can end a Puretext without being end of file, must be met inside this if)
-                // In this case, JET will add an additional newline when compared to Umple, so need to add it as well
-                else if (containsOnlySpaces(previousLine) && numNewlines == 2) {
-                    buffer.append(Constants.NewLine);
-                }
-            }
-            
-        }
-        
-        elements.add(new BasicElement(buffer.toString()));
-        
-        return line;
-    }
-    
-    private boolean operationIsFinished(String line, String ender) {
-        return line == null || line.indexOf(ender) != -1;
-    }
-    
-    
-    
-    private boolean containsFunctionEnderAtEnd(String line) {
-        if (line == null) {
-            return false;
-        }
-        
-        for (String functionEnder : Constants.FunctionEnders) {
-            int index = line.indexOf(functionEnder);
-            if (index != -1) {
-                // Dont care about what is before the brace
-                String startStartingFrom = line.substring(index);
-                if (startStartingFrom.trim().equals(functionEnder)) {
-                    return true;
-                }
-            }
-        }
-        
-        return false;
-    }
-    
-    // In JET, if a line starts with spaces followed by a directive, the spaces will not be included
-    // Umple will included it however
-    private String removeSpacesExtraIfIsSpacesFollowedByDirective(String line) {
-        if (line != null && isSpacesFollowedByDirective(line)) {
-            line = line.substring(line.indexOf(JETConstants.DirectiveStart));
-        }
-        return line;
-    }
-    
-    private String removeAnyTabs(String line) {
-        if (line != null && line.indexOf('\t') != -1) {
-            containsTabs = true;
-            line = line.replaceAll("\t", "    ");
-        }
-        
-        return line;
     }
     
     private boolean containsOnlySpaces(String line) {
@@ -454,26 +183,6 @@ class TemplateConverter {
         }
         
         return true;
-    }
-    
-    private boolean shouldAppendNewline(String line, Operation operation) {
-        if (line == null) {
-            return false;
-        }
-        
-        // In JET, the newline before a directive will not be included, but Umple will include it
-        // So if the next line is a directive with some spaces before, should not add the newline
-        return !isSpacesFollowedByDirective(line);
-    }
-    
-    // This is used for the directive hack
-    private boolean isSpacesFollowedByDirective(String line) {
-        int pos = line.indexOf(JETConstants.DirectiveStart);
-        if (pos == -1) {
-            return false;
-        }
-        
-        return containsOnlySpaces(line.substring(0, pos));
     }
     
     private void printWarning(String warningText) {
